@@ -1,0 +1,23 @@
+# Swift Package Manager
+.build/
+*.xcodeproj
+*.xcworkspace
+
+# macOS
+.DS_Store
+
+# Credentials
+credentials.json
+.env
+tokens.json
+config.json
+
+# Build artifacts
+*.app
+*.dSYM
+
+# User-specific
+*.swp
+*~
+.vscode/
+.idea/

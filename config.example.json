@@ -1,0 +1,20 @@
+{
+  "google": {
+    "clientID": "YOUR_CLIENT_ID.apps.googleusercontent.com",
+    "clientSecret": "YOUR_CLIENT_SECRET",
+    "calendarID": "primary"
+  },
+  "sync": {
+    "pastDays": 90,
+    "futureDays": 365,
+    "syncIntervalSeconds": 300
+  },
+  "calendars": {
+    "targetCalendars": ["マイMac", "予定表"],
+    "mode": "include"
+  },
+  "formatting": {
+    "include_location_in_description": true,
+    "location_prefix": "Location: "
+  }
+}

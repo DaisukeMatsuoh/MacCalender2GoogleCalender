@@ -8,6 +8,7 @@ struct SyncRecord: Codable {
     var lastSyncedAt: Date
     var macLastModified: Date
     var sourceCalendar: String
+    var contentHash: String
 
     enum CodingKeys: String, CodingKey {
         case macEventID = "mac_event_id"
@@ -15,6 +16,7 @@ struct SyncRecord: Codable {
         case lastSyncedAt = "last_synced_at"
         case macLastModified = "mac_last_modified"
         case sourceCalendar = "source_calendar"
+        case contentHash = "content_hash"
     }
 }
 
@@ -25,6 +27,9 @@ class SyncDatabase {
     private var db: OpaquePointer?
     private let fileURL: URL
     private let legacyJSONURL: URL
+
+    // Reuse date formatter for efficiency (DateFormatter creation is expensive)
+    private let dateFormatter = ISO8601DateFormatter()
 
     init() {
         let currentDir = FileManager.default.currentDirectoryPath
@@ -65,6 +70,7 @@ class SyncDatabase {
             last_synced_at TEXT NOT NULL,
             mac_last_modified TEXT NOT NULL,
             source_calendar TEXT NOT NULL,
+            content_hash TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
 
@@ -79,6 +85,16 @@ class SyncDatabase {
         } else {
             print("Sync records table ready")
         }
+
+        // Add content_hash column if it doesn't exist (for existing databases)
+        addContentHashColumnIfNeeded()
+    }
+
+    private func addContentHashColumnIfNeeded() {
+        let alterTableQuery = "ALTER TABLE sync_records ADD COLUMN content_hash TEXT NOT NULL DEFAULT '';"
+
+        // This will fail silently if column already exists, which is fine
+        sqlite3_exec(db, alterTableQuery, nil, nil, nil)
     }
 
     // MARK: - Migration from JSON
@@ -126,7 +142,8 @@ class SyncDatabase {
                     macEventID: record.macEventID,
                     googleEventID: record.googleEventID,
                     macLastModified: record.macLastModified,
-                    sourceCalendar: record.sourceCalendar
+                    sourceCalendar: record.sourceCalendar,
+                    contentHash: record.contentHash
                 )
             }
 
@@ -152,7 +169,7 @@ class SyncDatabase {
     /// Get sync record for a Mac event
     func getRecord(macEventID: String) -> SyncRecord? {
         let query = """
-        SELECT mac_event_id, google_event_id, last_synced_at, mac_last_modified, source_calendar
+        SELECT mac_event_id, google_event_id, last_synced_at, mac_last_modified, source_calendar, content_hash
         FROM sync_records
         WHERE mac_event_id = ?;
         """
@@ -196,7 +213,7 @@ class SyncDatabase {
     /// Get all sync records
     func getAllRecords() -> [SyncRecord] {
         let query = """
-        SELECT mac_event_id, google_event_id, last_synced_at, mac_last_modified, source_calendar
+        SELECT mac_event_id, google_event_id, last_synced_at, mac_last_modified, source_calendar, content_hash
         FROM sync_records
         ORDER BY last_synced_at DESC;
         """
@@ -207,7 +224,7 @@ class SyncDatabase {
     /// Get records for specific calendar
     func getRecords(forCalendar calendar: String) -> [SyncRecord] {
         let query = """
-        SELECT mac_event_id, google_event_id, last_synced_at, mac_last_modified, source_calendar
+        SELECT mac_event_id, google_event_id, last_synced_at, mac_last_modified, source_calendar, content_hash
         FROM sync_records
         WHERE source_calendar = ?
         ORDER BY last_synced_at DESC;
@@ -239,16 +256,18 @@ class SyncDatabase {
         macEventID: String,
         googleEventID: String,
         macLastModified: Date,
-        sourceCalendar: String
+        sourceCalendar: String,
+        contentHash: String
     ) {
         let query = """
-        INSERT INTO sync_records (mac_event_id, google_event_id, last_synced_at, mac_last_modified, source_calendar)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO sync_records (mac_event_id, google_event_id, last_synced_at, mac_last_modified, source_calendar, content_hash)
+        VALUES (?, ?, ?, ?, ?, ?)
         ON CONFLICT(mac_event_id) DO UPDATE SET
             google_event_id = excluded.google_event_id,
             last_synced_at = excluded.last_synced_at,
             mac_last_modified = excluded.mac_last_modified,
-            source_calendar = excluded.source_calendar;
+            source_calendar = excluded.source_calendar,
+            content_hash = excluded.content_hash;
         """
 
         var statement: OpaquePointer?
@@ -260,14 +279,15 @@ class SyncDatabase {
 
         defer { sqlite3_finalize(statement) }
 
-        let now = ISO8601DateFormatter().string(from: Date())
-        let modifiedStr = ISO8601DateFormatter().string(from: macLastModified)
+        let now = dateFormatter.string(from: Date())
+        let modifiedStr = dateFormatter.string(from: macLastModified)
 
         sqlite3_bind_text(statement, 1, (macEventID as NSString).utf8String, -1, nil)
         sqlite3_bind_text(statement, 2, (googleEventID as NSString).utf8String, -1, nil)
         sqlite3_bind_text(statement, 3, (now as NSString).utf8String, -1, nil)
         sqlite3_bind_text(statement, 4, (modifiedStr as NSString).utf8String, -1, nil)
         sqlite3_bind_text(statement, 5, (sourceCalendar as NSString).utf8String, -1, nil)
+        sqlite3_bind_text(statement, 6, (contentHash as NSString).utf8String, -1, nil)
 
         if sqlite3_step(statement) != SQLITE_DONE {
             let errorMessage = String(cString: sqlite3_errmsg(db))
@@ -276,10 +296,10 @@ class SyncDatabase {
     }
 
     /// Update last synced time
-    func updateLastSynced(macEventID: String, macLastModified: Date) {
+    func updateLastSynced(macEventID: String, macLastModified: Date, contentHash: String) {
         let query = """
         UPDATE sync_records
-        SET last_synced_at = ?, mac_last_modified = ?
+        SET last_synced_at = ?, mac_last_modified = ?, content_hash = ?
         WHERE mac_event_id = ?;
         """
 
@@ -290,12 +310,13 @@ class SyncDatabase {
 
         defer { sqlite3_finalize(statement) }
 
-        let now = ISO8601DateFormatter().string(from: Date())
-        let modifiedStr = ISO8601DateFormatter().string(from: macLastModified)
+        let now = dateFormatter.string(from: Date())
+        let modifiedStr = dateFormatter.string(from: macLastModified)
 
         sqlite3_bind_text(statement, 1, (now as NSString).utf8String, -1, nil)
         sqlite3_bind_text(statement, 2, (modifiedStr as NSString).utf8String, -1, nil)
-        sqlite3_bind_text(statement, 3, (macEventID as NSString).utf8String, -1, nil)
+        sqlite3_bind_text(statement, 3, (contentHash as NSString).utf8String, -1, nil)
+        sqlite3_bind_text(statement, 4, (macEventID as NSString).utf8String, -1, nil)
 
         sqlite3_step(statement)
     }
@@ -324,7 +345,7 @@ class SyncDatabase {
 
     /// Clean up old records (events older than specified date and not in Mac calendar)
     func cleanupOldRecords(olderThan date: Date) {
-        let dateStr = ISO8601DateFormatter().string(from: date)
+        let dateStr = dateFormatter.string(from: date)
         let query = """
         DELETE FROM sync_records
         WHERE mac_last_modified < ?;
@@ -407,10 +428,10 @@ class SyncDatabase {
         let lastSyncedAtStr = String(cString: sqlite3_column_text(statement, 2))
         let macLastModifiedStr = String(cString: sqlite3_column_text(statement, 3))
         let sourceCalendar = String(cString: sqlite3_column_text(statement, 4))
+        let contentHash = String(cString: sqlite3_column_text(statement, 5))
 
-        let formatter = ISO8601DateFormatter()
-        guard let lastSyncedAt = formatter.date(from: lastSyncedAtStr),
-              let macLastModified = formatter.date(from: macLastModifiedStr) else {
+        guard let lastSyncedAt = dateFormatter.date(from: lastSyncedAtStr),
+              let macLastModified = dateFormatter.date(from: macLastModifiedStr) else {
             return nil
         }
 
@@ -419,7 +440,8 @@ class SyncDatabase {
             googleEventID: googleEventID,
             lastSyncedAt: lastSyncedAt,
             macLastModified: macLastModified,
-            sourceCalendar: sourceCalendar
+            sourceCalendar: sourceCalendar,
+            contentHash: contentHash
         )
     }
 }

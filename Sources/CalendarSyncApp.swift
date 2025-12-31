@@ -50,6 +50,26 @@ class CalendarSyncApp {
         requestCalendarAccess()
     }
 
+    /// Initialize only Google API authentication without starting sync
+    /// Use this for cleanup commands that only need API access
+    func initializeForCleanup() {
+        print("Loading configuration for cleanup...")
+        if let config = Config.load() {
+            self.config = config
+            if let googleConfig = config.google {
+                self.googleAPI = GoogleCalendarAPI(
+                    clientID: googleConfig.clientID,
+                    clientSecret: googleConfig.clientSecret
+                )
+                print("Configuration loaded successfully (Google API configured)")
+            } else {
+                print("Error: Google API not configured in config.json")
+            }
+        } else {
+            print("Error: config.json not found")
+        }
+    }
+
     private func requestCalendarAccess() {
         if #available(macOS 14.0, *) {
             eventStore.requestFullAccessToEvents { [weak self] granted, error in
@@ -137,6 +157,16 @@ class CalendarSyncApp {
     @objc private func calendarChanged(notification: Notification) {
         print("Calendar changed detected")
         syncRecentEvents()
+    }
+
+    /// Create a unique key for an event occurrence
+    /// For recurring events, each occurrence has the same eventIdentifier but different start time
+    /// This function creates a unique key that combines both
+    private func makeOccurrenceKey(for event: EKEvent) -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        let startStr = formatter.string(from: event.startDate)
+        return "\(event.eventIdentifier)_\(startStr)"
     }
 
     private func syncRecentEvents() {
@@ -255,18 +285,6 @@ class CalendarSyncApp {
         let events = eventStore.events(matching: predicate)
         print("[DEBUG] Raw event count: \(events.count)")
 
-        // Also try a broader search to see if events exist outside expected range
-        print("\n[DEBUG] Testing with broader date range (past 365 days to future 730 days)...")
-        let broadStartDate = Calendar.current.date(byAdding: .day, value: -365, to: Date())!
-        let broadEndDate = Calendar.current.date(byAdding: .day, value: 730, to: Date())!
-        let broadPredicate = eventStore.predicateForEvents(
-            withStart: broadStartDate,
-            end: broadEndDate,
-            calendars: targetCalendars
-        )
-        let broadEvents = eventStore.events(matching: broadPredicate)
-        print("[DEBUG] Broader search found: \(broadEvents.count) events")
-
         print("\n--- Found \(events.count) event(s) in target calendars ---")
 
         if events.isEmpty {
@@ -282,8 +300,28 @@ class CalendarSyncApp {
         // Create a set of current Mac event IDs for deletion detection
         var currentMacEventIDs = Set<String>()
 
+        // Classify events into categories for batch processing
+        var newEvents: [EKEvent] = []
+        var updatedEvents: [EKEvent] = []
+        var unchangedCount = 0
+
+        // Track processed event occurrences to avoid duplicates
+        // For recurring events, we need to distinguish each occurrence
+        var processedOccurrences = Set<String>()
+
         for (index, event) in events.enumerated() {
-            currentMacEventIDs.insert(event.eventIdentifier)
+            // Create unique key for this occurrence (handles recurring events)
+            let occurrenceKey = makeOccurrenceKey(for: event)
+
+            // Use occurrenceKey for deletion detection (must match what's stored in DB)
+            currentMacEventIDs.insert(occurrenceKey)
+
+            // Skip if already processed (can happen with recurring events)
+            if processedOccurrences.contains(occurrenceKey) {
+                print("\n[SKIP] Duplicate occurrence: \(event.title ?? "Untitled") at \(event.startDate)")
+                continue
+            }
+            processedOccurrences.insert(occurrenceKey)
 
             print("\n[\(index + 1)/\(events.count)] \(event.title ?? "Untitled")")
             print("  📅 Start: \(dateFormatter.string(from: event.startDate))")
@@ -297,8 +335,76 @@ class CalendarSyncApp {
             }
             print("  🕐 All-day: \(event.isAllDay ? "Yes" : "No")")
 
-            // TODO: Sync to Google Calendar
-            syncEventToGoogle(event)
+            // Classify event
+            let currentHash = EventConverter.calculateContentHash(event)
+
+            // Debug: Print hash for first event
+            if index == 0 {
+                print("  [DEBUG] First event hash: \(currentHash)")
+            }
+
+            // Use occurrence key instead of just eventIdentifier
+            // This handles recurring events where each occurrence has the same ID
+            if let record = syncDatabase.getRecord(macEventID: occurrenceKey) {
+                // Existing event - check if modified
+                let eventModified = event.lastModifiedDate
+                let hasModificationDate = eventModified != nil
+                let modificationDateChanged = hasModificationDate && eventModified! > record.macLastModified
+
+                if modificationDateChanged {
+                    if currentHash == record.contentHash {
+                        print("  -> Modification date changed, but content identical - updating DB only")
+                        syncDatabase.updateLastSynced(
+                            macEventID: occurrenceKey,
+                            macLastModified: eventModified!,
+                            contentHash: currentHash
+                        )
+                        unchangedCount += 1
+                    } else {
+                        print("  -> Content changed - will update via API")
+                        updatedEvents.append(event)
+                    }
+                } else if !hasModificationDate {
+                    if currentHash == record.contentHash {
+                        print("  -> No modification date, but hash matches - skipping")
+                        unchangedCount += 1
+                    } else {
+                        print("  -> No modification date, but hash differs - will update")
+                        updatedEvents.append(event)
+                    }
+                } else {
+                    if currentHash == record.contentHash {
+                        print("  -> No changes detected - skipping")
+                        unchangedCount += 1
+                    } else {
+                        print("  -> Content changed without timestamp update - will update")
+                        updatedEvents.append(event)
+                    }
+                }
+            } else {
+                // New event
+                print("  -> New event - will create via API")
+                newEvents.append(event)
+            }
+        }
+
+        print("\n--- Event classification complete ---")
+        print("  New events: \(newEvents.count)")
+        print("  Updated events: \(updatedEvents.count)")
+        print("  Unchanged events: \(unchangedCount)")
+
+        // Process new events in batches
+        if !newEvents.isEmpty {
+            print("\n--- Batch creating \(newEvents.count) new event(s) ---")
+            batchCreateEvents(newEvents)
+        }
+
+        // Process updated events individually (batch update is complex due to different event IDs)
+        if !updatedEvents.isEmpty {
+            print("\n--- Updating \(updatedEvents.count) event(s) ---")
+            for event in updatedEvents {
+                syncEventToGoogle(event)
+            }
         }
 
         // Check for deleted events (in database but not in current Mac calendar)
@@ -322,63 +428,117 @@ class CalendarSyncApp {
             return
         }
 
-        // Convert EKEvent to Google Calendar format
-        let googleEvent = EventConverter.toGoogleCalendarEvent(event, config: config)
+        // Use occurrence key for recurring events
+        let occurrenceKey = makeOccurrenceKey(for: event)
+
+        // Calculate current content hash
+        let currentHash = EventConverter.calculateContentHash(event)
 
         // Check if already synced in database
-        if let record = syncDatabase.getRecord(macEventID: event.eventIdentifier) {
+        if let record = syncDatabase.getRecord(macEventID: occurrenceKey) {
             print("  -> Already synced (Google Event ID: \(record.googleEventID))")
 
-            // Check if event has been modified since last sync
-            if let eventModified = event.lastModifiedDate,
-               eventModified > record.macLastModified {
-                print("  -> Event has been modified since last sync")
-                print("     Last synced: \(record.macLastModified)")
-                print("     Last modified: \(eventModified)")
-                print("  -> Updating Google Calendar event...")
+            // Hybrid approach: Check lastModifiedDate first, then verify with content hash
+            let eventModified = event.lastModifiedDate
+            let hasModificationDate = eventModified != nil
+            let modificationDateChanged = hasModificationDate && eventModified! > record.macLastModified
 
-                // Use semaphore for synchronous operation
-                let semaphore = DispatchSemaphore(value: 0)
-                var shouldRecreate = false
+            if modificationDateChanged {
+                // lastModifiedDate indicates a change - verify with content hash
+                if currentHash == record.contentHash {
+                    print("  -> Modification date changed, but content is identical (hash match)")
+                    print("     Skipping API call - false positive from timestamp update")
+                    // Update only the timestamp in database to avoid future checks
+                    syncDatabase.updateLastSynced(
+                        macEventID: occurrenceKey,
+                        macLastModified: eventModified!,
+                        contentHash: currentHash
+                    )
+                    return
+                } else {
+                    print("  -> Event content has changed (hash mismatch)")
+                    print("     Last synced: \(record.macLastModified)")
+                    print("     Last modified: \(eventModified!)")
+                    print("     Old hash: \(record.contentHash) (len=\(record.contentHash.count))")
+                    print("     New hash: \(currentHash) (len=\(currentHash.count))")
+                    print("  -> Updating Google Calendar event...")
+                }
+            } else if !hasModificationDate {
+                // No lastModifiedDate available - fallback to hash comparison only
+                if currentHash == record.contentHash {
+                    print("  -> No modification date, but content hash matches")
+                    print("     Skipping API call - content unchanged")
+                    return
+                } else {
+                    print("  -> No modification date, but content hash differs")
+                    print("     Old hash: \(record.contentHash) (len=\(record.contentHash.count))")
+                    print("     New hash: \(currentHash) (len=\(currentHash.count))")
+                    print("  -> Updating Google Calendar event...")
+                }
+            } else {
+                // Modification date exists but hasn't changed
+                if currentHash == record.contentHash {
+                    print("  -> No changes detected (timestamp and hash both unchanged)")
+                    print("     Skipping API call")
+                    return
+                } else {
+                    // Edge case: hash changed but timestamp didn't (rare, but possible)
+                    print("  -> Content hash changed without timestamp update (rare edge case)")
+                    print("     Old hash: \(record.contentHash) (len=\(record.contentHash.count))")
+                    print("     New hash: \(currentHash) (len=\(currentHash.count))")
+                    print("  -> Updating Google Calendar event...")
+                }
+            }
 
-                googleAPI.updateEvent(googleEvent, eventID: record.googleEventID, calendarID: googleConfig.calendarID) { [weak self] result in
-                    guard let self = self else {
-                        semaphore.signal()
-                        return
-                    }
+            // If we reach here, we need to update the event
+            let googleEvent = EventConverter.toGoogleCalendarEvent(event, config: config)
+            let semaphore = DispatchSemaphore(value: 0)
+            var shouldRecreate = false
 
-                    switch result {
-                    case .success:
-                        print("  -> Successfully updated in Google Calendar")
-                        // Update the last modified time in database
-                        self.syncDatabase.updateLastSynced(macEventID: event.eventIdentifier, macLastModified: eventModified)
-
-                    case .failure(let error):
-                        let nsError = error as NSError
-                        if nsError.code == 404 {
-                            // Event was deleted on Google side - need to recreate
-                            print("  -> Event not found in Google Calendar (was deleted)")
-                            print("  -> Will recreate the event...")
-                            shouldRecreate = true
-                        } else {
-                            print("  -> Failed to update: \(error.localizedDescription)")
-                        }
-                    }
+            googleAPI.updateEvent(googleEvent, eventID: record.googleEventID, calendarID: googleConfig.calendarID) { [weak self] result in
+                guard let self = self else {
                     semaphore.signal()
+                    return
                 }
 
-                semaphore.wait()
+                switch result {
+                case .success:
+                    print("  -> Successfully updated in Google Calendar")
+                    // Update the database with new hash and timestamp
+                    self.syncDatabase.updateLastSynced(
+                        macEventID: occurrenceKey,
+                        macLastModified: eventModified ?? Date(),
+                        contentHash: currentHash
+                    )
 
-                // If event was deleted on Google side, recreate it
-                if shouldRecreate {
-                    recreateEventInGoogle(event: event, oldGoogleEventID: record.googleEventID)
+                case .failure(let error):
+                    let nsError = error as NSError
+                    if nsError.code == 404 {
+                        // Event was deleted on Google side - need to recreate
+                        print("  -> Event not found in Google Calendar (was deleted)")
+                        print("  -> Will recreate the event...")
+                        shouldRecreate = true
+                    } else {
+                        print("  -> Failed to update: \(error.localizedDescription)")
+                    }
                 }
+                semaphore.signal()
+            }
+
+            semaphore.wait()
+
+            // If event was deleted on Google side, recreate it
+            if shouldRecreate {
+                recreateEventInGoogle(event: event, oldGoogleEventID: record.googleEventID)
             }
             return
         }
 
         // New event - create in Google Calendar
-        print("  -> Syncing new event to Google Calendar...")
+        print("  -> New event detected - syncing to Google Calendar...")
+        print("     Content hash: \(currentHash.prefix(8))...")
+
+        let googleEvent = EventConverter.toGoogleCalendarEvent(event, config: config)
 
         // Create event in Google Calendar
         googleAPI.createEvent(googleEvent, calendarID: googleConfig.calendarID) { [weak self] result in
@@ -388,18 +548,142 @@ class CalendarSyncApp {
             case .success(let googleEventID):
                 print("  -> Successfully synced to Google Calendar (ID: \(googleEventID))")
 
-                // Save to sync database
+                // Save to sync database with content hash
                 self.syncDatabase.upsertRecord(
-                    macEventID: event.eventIdentifier,
+                    macEventID: occurrenceKey,
                     googleEventID: googleEventID,
                     macLastModified: event.lastModifiedDate ?? Date(),
-                    sourceCalendar: event.calendar.title
+                    sourceCalendar: event.calendar.title,
+                    contentHash: currentHash
                 )
 
             case .failure(let error):
                 print("  -> Failed to sync: \(error.localizedDescription)")
             }
         }
+    }
+
+    private func batchCreateEvents(_ events: [EKEvent]) {
+        guard let googleAPI = googleAPI,
+              let config = config,
+              let googleConfig = config.google else {
+            print("  -> Google API not configured, skipping batch create")
+            return
+        }
+
+        // Split into batches of 100 (Google API limit per batch request)
+        // Each batch counts as 1 API call, so no delay needed between batches
+        let batchSize = 100
+        let batches = stride(from: 0, to: events.count, by: batchSize).map {
+            Array(events[$0..<min($0 + batchSize, events.count)])
+        }
+
+        print("  -> Processing \(events.count) events in \(batches.count) batch(es)")
+
+        for (batchIndex, batch) in batches.enumerated() {
+            print("\n  -> Batch \(batchIndex + 1)/\(batches.count): Creating \(batch.count) events...")
+
+            // Prepare batch requests
+            let requests = batch.map { event in
+                GoogleCalendarAPI.BatchCreateRequest(
+                    event: EventConverter.toGoogleCalendarEvent(event, config: config),
+                    calendarID: googleConfig.calendarID
+                )
+            }
+
+            // Execute batch request with retry logic for rate limit errors only
+            var retryCount = 0
+            let maxRetries = 3
+            var batchCompleted = false
+
+            while !batchCompleted && retryCount <= maxRetries {
+                if retryCount > 0 {
+                    // Exponential backoff only when rate limit is hit: 30s, 60s, 120s
+                    let waitTime = 30.0 * pow(2.0, Double(retryCount - 1))
+                    print("  -> Rate limit hit, waiting \(Int(waitTime)) seconds before retry \(retryCount)/\(maxRetries)...")
+                    Thread.sleep(forTimeInterval: waitTime)
+                }
+
+                let semaphore = DispatchSemaphore(value: 0)
+                var shouldRetry = false
+
+                googleAPI.batchCreateEvents(requests) { [weak self] result in
+                    guard let self = self else {
+                        semaphore.signal()
+                        return
+                    }
+
+                    switch result {
+                    case .success(let batchResult):
+                        // Check if all failures are rate limit errors
+                        let rateLimitFailures = batchResult.failures.filter { (_, error) in
+                            let desc = error.localizedDescription.lowercased()
+                            return desc.contains("403") || desc.contains("quota") || desc.contains("rate")
+                        }
+
+                        if rateLimitFailures.count == batchResult.failures.count && !batchResult.failures.isEmpty && batchResult.success.isEmpty {
+                            // All failures are rate limit errors, retry the whole batch
+                            shouldRetry = true
+                        } else {
+                            print("  -> Batch \(batchIndex + 1) complete:")
+                            print("     ✓ Success: \(batchResult.success.count) events")
+                            if batchResult.failures.count > 0 {
+                                print("     ✗ Failures: \(batchResult.failures.count) events")
+                            }
+
+                            // Save successful creates to database
+                            for (itemIndex, googleEventID) in batchResult.success {
+                                if itemIndex < batch.count {
+                                    let event = batch[itemIndex]
+                                    let occurrenceKey = self.makeOccurrenceKey(for: event)
+                                    let currentHash = EventConverter.calculateContentHash(event)
+                                    self.syncDatabase.upsertRecord(
+                                        macEventID: occurrenceKey,
+                                        googleEventID: googleEventID,
+                                        macLastModified: event.lastModifiedDate ?? Date(),
+                                        sourceCalendar: event.calendar.title,
+                                        contentHash: currentHash
+                                    )
+                                }
+                            }
+
+                            // Report non-rate-limit failures
+                            for (failedIndex, error) in batchResult.failures {
+                                if failedIndex < batch.count {
+                                    let event = batch[failedIndex]
+                                    print("     ✗ Failed to create '\(event.title ?? "Untitled")': \(error.localizedDescription)")
+                                }
+                            }
+                            batchCompleted = true
+                        }
+
+                    case .failure(let error):
+                        let desc = error.localizedDescription.lowercased()
+                        if desc.contains("403") || desc.contains("quota") || desc.contains("rate") {
+                            shouldRetry = true
+                        } else {
+                            print("  -> Batch \(batchIndex + 1) failed: \(error.localizedDescription)")
+                            batchCompleted = true
+                        }
+                    }
+
+                    semaphore.signal()
+                }
+
+                semaphore.wait()
+
+                if shouldRetry {
+                    retryCount += 1
+                    if retryCount > maxRetries {
+                        print("  -> Batch \(batchIndex + 1) failed after \(maxRetries) retries due to rate limiting")
+                        print("     These events will be created on the next sync cycle")
+                        batchCompleted = true
+                    }
+                }
+            }
+        }
+
+        print("\n  -> Batch creation complete")
     }
 
     private func recreateEventInGoogle(event: EKEvent, oldGoogleEventID: String) {
@@ -409,7 +693,9 @@ class CalendarSyncApp {
             return
         }
 
+        let occurrenceKey = makeOccurrenceKey(for: event)
         let googleEvent = EventConverter.toGoogleCalendarEvent(event, config: config)
+        let currentHash = EventConverter.calculateContentHash(event)
 
         let semaphore = DispatchSemaphore(value: 0)
 
@@ -423,12 +709,13 @@ class CalendarSyncApp {
             case .success(let newGoogleEventID):
                 print("  -> Successfully recreated in Google Calendar (new ID: \(newGoogleEventID))")
 
-                // Update database with new Google event ID
+                // Update database with new Google event ID and content hash
                 self.syncDatabase.upsertRecord(
-                    macEventID: event.eventIdentifier,
+                    macEventID: occurrenceKey,
                     googleEventID: newGoogleEventID,
                     macLastModified: event.lastModifiedDate ?? Date(),
-                    sourceCalendar: event.calendar.title
+                    sourceCalendar: event.calendar.title,
+                    contentHash: currentHash
                 )
 
             case .failure(let error):
@@ -456,54 +743,75 @@ class CalendarSyncApp {
         let allRecords = syncDatabase.getAllRecords()
         let relevantRecords = allRecords.filter { targetCalendarNames.contains($0.sourceCalendar) }
 
-        var deletedCount = 0
-        var skippedCount = 0
+        // Find records for deleted events
+        var deletedRecords: [(macEventID: String, googleEventID: String)] = []
 
         for record in relevantRecords {
             // If event is in database but not in current Mac events, it was deleted
             if !currentMacEventIDs.contains(record.macEventID) {
-                print("\n🗑️  Deleted event detected:")
-                print("  Mac Event ID: \(record.macEventID)")
-                print("  Google Event ID: \(record.googleEventID)")
-                print("  Calendar: \(record.sourceCalendar)")
-                print("  -> Deleting from Google Calendar...")
-
-                // Delete from Google Calendar
-                let semaphore = DispatchSemaphore(value: 0)
-                var deleteSucceeded = false
-
-                googleAPI.deleteEvent(eventID: record.googleEventID, calendarID: googleConfig.calendarID) { result in
-                    switch result {
-                    case .success:
-                        print("  -> Successfully deleted from Google Calendar")
-                        deleteSucceeded = true
-                    case .failure(let error):
-                        print("  -> Failed to delete from Google Calendar: \(error.localizedDescription)")
-                    }
-                    semaphore.signal()
-                }
-
-                semaphore.wait()
-
-                // Remove from local database
-                if deleteSucceeded {
-                    syncDatabase.removeRecord(macEventID: record.macEventID)
-                    print("  -> Removed from sync database")
-                    deletedCount += 1
-                } else {
-                    skippedCount += 1
-                }
+                deletedRecords.append((macEventID: record.macEventID, googleEventID: record.googleEventID))
             }
         }
 
-        if deletedCount > 0 {
-            print("\n✓ Deleted \(deletedCount) event(s) from Google Calendar")
-        }
-        if skippedCount > 0 {
-            print("⚠️  Skipped \(skippedCount) event(s) due to deletion errors")
-        }
-        if deletedCount == 0 && skippedCount == 0 {
+        if deletedRecords.isEmpty {
             print("No deleted events detected")
+            return
+        }
+
+        print("\n🗑️  Found \(deletedRecords.count) deleted event(s), removing from Google Calendar...")
+
+        // Use batch delete for efficiency
+        let batchSize = 100
+        let batches = stride(from: 0, to: deletedRecords.count, by: batchSize).map {
+            Array(deletedRecords[$0..<min($0 + batchSize, deletedRecords.count)])
+        }
+
+        var totalDeleted = 0
+        var totalFailed = 0
+
+        for (batchIndex, batch) in batches.enumerated() {
+            let eventIDs = batch.map { $0.googleEventID }
+
+            let semaphore = DispatchSemaphore(value: 0)
+
+            googleAPI.batchDeleteEvents(eventIDs: eventIDs, calendarID: googleConfig.calendarID) { [weak self] result in
+                guard let self = self else {
+                    semaphore.signal()
+                    return
+                }
+
+                switch result {
+                case .success(let batchResult):
+                    // Remove successfully deleted events from database
+                    for successIndex in batchResult.success {
+                        if successIndex < batch.count {
+                            let record = batch[successIndex]
+                            self.syncDatabase.removeRecord(macEventID: record.macEventID)
+                            totalDeleted += 1
+                        }
+                    }
+                    totalFailed += batchResult.failures.count
+
+                    if batches.count > 1 {
+                        print("  -> Batch \(batchIndex + 1)/\(batches.count): \(batchResult.success.count) deleted, \(batchResult.failures.count) failed")
+                    }
+
+                case .failure(let error):
+                    print("  -> Batch \(batchIndex + 1) failed: \(error.localizedDescription)")
+                    totalFailed += batch.count
+                }
+
+                semaphore.signal()
+            }
+
+            semaphore.wait()
+        }
+
+        if totalDeleted > 0 {
+            print("\n✓ Deleted \(totalDeleted) event(s) from Google Calendar")
+        }
+        if totalFailed > 0 {
+            print("⚠️  Failed to delete \(totalFailed) event(s)")
         }
     }
 
@@ -608,5 +916,259 @@ class CalendarSyncApp {
             runtimeLocationInDescription = location
         }
         print("Runtime config loaded")
+    }
+
+    // MARK: - Cleanup Functions
+
+    /// Delete all events from Google Calendar that were created by this sync tool
+    /// Identifies events by checking extendedProperties.private.macEventID
+    /// This is safe because it only deletes events created by this tool
+    func deleteAllSyncedGoogleEvents(completion: @escaping () -> Void) {
+        guard let googleAPI = googleAPI,
+              let config = config,
+              let googleConfig = config.google else {
+            print("Google API not configured")
+            completion()
+            return
+        }
+
+        print("\n=== Deleting all synced events from Google Calendar ===")
+        print("This will delete ONLY events created by this sync tool")
+        print("(Events are identified by extendedProperties.private.macEventID)")
+
+        // Fetch all events from Google Calendar
+        print("Fetching events from Google Calendar...")
+        googleAPI.listEvents(calendarID: googleConfig.calendarID) { [weak self] result in
+            guard let self = self else { return }
+
+            switch result {
+            case .success(let allEvents):
+                print("Found \(allEvents.count) total event(s) in Google Calendar")
+
+                // Filter events that have macEventID (created by this tool)
+                let syncedEvents = allEvents.filter { event in
+                    event.extendedProperties?.private?["macEventID"] != nil
+                }
+
+                print("Found \(syncedEvents.count) event(s) created by this sync tool")
+
+                if syncedEvents.isEmpty {
+                    print("No synced events to delete")
+                    completion()
+                    return
+                }
+
+                // Ask for confirmation
+                print("\n⚠️  WARNING: This will delete \(syncedEvents.count) event(s) from Google Calendar!")
+                print("These are events that were created by this sync tool.")
+                print("This action cannot be undone.")
+                print("Type 'yes' to continue or anything else to cancel: ", terminator: "")
+
+                guard let input = readLine(), input.lowercased() == "yes" else {
+                    print("Deletion cancelled")
+                    completion()
+                    return
+                }
+
+                // Delete the synced events
+                self.deleteSyncedEventsInBatches(
+                    events: syncedEvents,
+                    googleAPI: googleAPI,
+                    calendarID: googleConfig.calendarID,
+                    completion: completion
+                )
+
+            case .failure(let error):
+                print("Failed to fetch events: \(error.localizedDescription)")
+                completion()
+            }
+        }
+    }
+
+    /// Delete all events from Google Calendar that contain sync marker in description
+    /// This catches older events that may not have macEventID in extendedProperties
+    func deleteAllSyncedGoogleEventsByDescription(completion: @escaping () -> Void) {
+        guard let googleAPI = googleAPI,
+              let config = config,
+              let googleConfig = config.google else {
+            print("Google API not configured")
+            completion()
+            return
+        }
+
+        print("\n=== Deleting all synced events from Google Calendar (by description) ===")
+        print("This will delete events with '[Synced from Mac Calendar' in description")
+
+        // Fetch all events from Google Calendar with wide time range
+        print("Fetching events from Google Calendar...")
+        let pastDate = Calendar.current.date(byAdding: .year, value: -5, to: Date())!
+        let futureDate = Calendar.current.date(byAdding: .year, value: 5, to: Date())!
+
+        googleAPI.listEvents(calendarID: googleConfig.calendarID, timeMin: pastDate, timeMax: futureDate) { [weak self] result in
+            guard let self = self else { return }
+
+            switch result {
+            case .success(let allEvents):
+                print("Found \(allEvents.count) total event(s) in Google Calendar")
+
+                // Debug: Show sample of event descriptions
+                print("\n[DEBUG] Sample of first 10 event descriptions:")
+                for (index, event) in allEvents.prefix(10).enumerated() {
+                    let desc = event.description ?? "(no description)"
+                    let preview = String(desc.prefix(100)).replacingOccurrences(of: "\n", with: "\\n")
+                    print("  [\(index)] \(event.summary ?? "Untitled"): \(preview)")
+                }
+
+                // Filter events that have sync marker in description
+                let syncedEvents = allEvents.filter { event in
+                    if let description = event.description {
+                        return description.contains("[Synced from Mac Calendar")
+                    }
+                    return false
+                }
+
+                // Also include events with macEventID for completeness
+                let eventsWithMacID = allEvents.filter { event in
+                    event.extendedProperties?.private?["macEventID"] != nil
+                }
+
+                // Merge both sets (using Set to avoid duplicates)
+                var eventIDsToDelete = Set<String>()
+                for event in syncedEvents {
+                    eventIDsToDelete.insert(event.id)
+                }
+                for event in eventsWithMacID {
+                    eventIDsToDelete.insert(event.id)
+                }
+
+                let eventsToDelete = allEvents.filter { eventIDsToDelete.contains($0.id) }
+                let eventsToKeep = allEvents.filter { !eventIDsToDelete.contains($0.id) }
+
+                print("\nFound \(syncedEvents.count) event(s) with sync marker in description")
+                print("Found \(eventsWithMacID.count) event(s) with macEventID")
+                print("Total unique events to delete: \(eventsToDelete.count)")
+                print("Events that will NOT be deleted: \(eventsToKeep.count)")
+
+                // Show sample of events TO DELETE
+                print("\n[DEBUG] Sample of events TO BE DELETED (first 5):")
+                for (index, event) in eventsToDelete.prefix(5).enumerated() {
+                    let desc = event.description ?? "(no description)"
+                    let preview = String(desc.prefix(80)).replacingOccurrences(of: "\n", with: "\\n")
+                    print("  [\(index)] \(event.summary ?? "Untitled")")
+                    print("       desc: \(preview)")
+                }
+
+                // Show sample of events NOT to delete
+                print("\n[DEBUG] Sample of events that will be KEPT (first 5):")
+                for (index, event) in eventsToKeep.prefix(5).enumerated() {
+                    let desc = event.description ?? "(no description)"
+                    let preview = String(desc.prefix(80)).replacingOccurrences(of: "\n", with: "\\n")
+                    print("  [\(index)] \(event.summary ?? "Untitled")")
+                    print("       desc: \(preview)")
+                }
+
+                if eventsToDelete.isEmpty {
+                    print("No synced events to delete")
+                    completion()
+                    return
+                }
+
+                // Ask for confirmation
+                print("\n⚠️  WARNING: This will delete \(eventsToDelete.count) event(s) from Google Calendar!")
+                print("Events that will be KEPT: \(eventsToKeep.count)")
+                print("This action cannot be undone.")
+                print("Type 'yes' to continue or anything else to cancel: ", terminator: "")
+
+                guard let input = readLine(), input.lowercased() == "yes" else {
+                    print("Deletion cancelled")
+                    completion()
+                    return
+                }
+
+                // Delete the synced events
+                self.deleteSyncedEventsInBatches(
+                    events: eventsToDelete,
+                    googleAPI: googleAPI,
+                    calendarID: googleConfig.calendarID,
+                    completion: completion
+                )
+
+            case .failure(let error):
+                print("Failed to fetch events: \(error.localizedDescription)")
+                completion()
+            }
+        }
+    }
+
+    private func deleteSyncedEventsInBatches(
+        events: [GoogleCalendarAPI.CalendarEventResponse],
+        googleAPI: GoogleCalendarAPI,
+        calendarID: String,
+        completion: @escaping () -> Void
+    ) {
+        let eventIDs = events.map { $0.id }
+        let batchSize = 100
+        let batches = stride(from: 0, to: eventIDs.count, by: batchSize).map {
+            Array(eventIDs[$0..<min($0 + batchSize, eventIDs.count)])
+        }
+
+        print("\nDeleting \(eventIDs.count) events in \(batches.count) batch(es)...")
+
+        var totalDeleted = 0
+        var totalFailed = 0
+        var currentBatchIndex = 0
+
+        func processNextBatch() {
+            guard currentBatchIndex < batches.count else {
+                // All batches complete
+                print("\n=== Deletion complete ===")
+                print("  Successfully deleted: \(totalDeleted)")
+                print("  Failed: \(totalFailed)")
+
+                // Clear the database
+                print("\nClearing sync database...")
+                self.syncDatabase.clearAll()
+                print("Database cleared")
+
+                completion()
+                return
+            }
+
+            let batch = batches[currentBatchIndex]
+            let batchNumber = currentBatchIndex + 1
+
+            print("  -> Batch \(batchNumber)/\(batches.count): Deleting \(batch.count) events...")
+
+            googleAPI.batchDeleteEvents(eventIDs: batch, calendarID: calendarID) { result in
+                switch result {
+                case .success(let batchResult):
+                    totalDeleted += batchResult.success.count
+                    totalFailed += batchResult.failures.count
+
+                    print("  -> Batch \(batchNumber) complete: \(batchResult.success.count) deleted, \(batchResult.failures.count) failed")
+
+                    for (index, error) in batchResult.failures {
+                        if index < batch.count {
+                            print("     ✗ Failed to delete \(batch[index]): \(error.localizedDescription)")
+                        }
+                    }
+
+                case .failure(let error):
+                    totalFailed += batch.count
+                    print("  -> Batch \(batchNumber) failed: \(error.localizedDescription)")
+                }
+
+                currentBatchIndex += 1
+
+                // Add delay between batches to be safe with rate limits
+                if currentBatchIndex < batches.count {
+                    Thread.sleep(forTimeInterval: 1.0)
+                }
+
+                processNextBatch()
+            }
+        }
+
+        processNextBatch()
     }
 }

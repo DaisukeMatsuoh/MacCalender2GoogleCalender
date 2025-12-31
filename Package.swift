@@ -18,6 +18,11 @@ let package = Package(
             name: "MacCalendarSync",
             dependencies: [],
             path: "Sources"
+        ),
+        .testTarget(
+            name: "MacCalendarSyncTests",
+            dependencies: ["MacCalendarSync"],
+            path: "Tests"
         )
     ]
 )
